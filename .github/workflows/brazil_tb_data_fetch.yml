@@ -1,11 +1,6 @@
-name: Brazil TB public-data fetch
+name: Brazil national SINAN-TB via PySUS
 
 on:
-  push:
-    branches:
-      - automation/brazil-tb-model-20260718
-    paths:
-      - .github/workflows/brazil_tb_data_fetch.yml
   pull_request:
     branches:
       - feat/initial-simulation-structure
@@ -17,84 +12,258 @@ permissions:
   contents: read
 
 jobs:
-  fetch-goias-tb:
+  fetch-national-sinan-tb:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 90
     steps:
-      - name: Download official Goias SINAN-TB CSV
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pinned extraction dependencies
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p artifact
-          URL='https://dadosabertos.go.gov.br/dataset/ed7560d6-8547-420f-b86e-6a9b2389dcfb/resource/7da6db7e-7ac4-4a9d-9b8f-c8ff3b141f75/download/tuberculose.csv'
-          curl --fail --location --retry 5 --retry-all-errors --connect-timeout 30 --max-time 600 \
-            "$URL" -o artifact/goias_tuberculose.csv
-          test "$(stat -c%s artifact/goias_tuberculose.csv)" -gt 100000
-          sha256sum artifact/goias_tuberculose.csv > artifact/SHA256SUMS.txt
-          printf '%s\n' "$URL" > artifact/SOURCE_URL.txt
+          python -m pip install --upgrade pip
+          python -m pip install 'pysus==2.7.0' pandas pyarrow duckdb
+          python - <<'PY'
+          import importlib.metadata as m
+          for pkg in ['pysus', 'pandas', 'pyarrow', 'duckdb']:
+              print(pkg, m.version(pkg))
+          PY
 
-      - name: Validate and profile CSV without external dependencies
+      - name: Download national SINAN tuberculosis data for 2015-2025
         shell: bash
         run: |
+          set -euo pipefail
+          mkdir -p artifact/per_year artifact/provenance
           python - <<'PY'
-          import csv, json
-          from collections import Counter
+          from __future__ import annotations
+
+          import hashlib
+          import importlib.metadata
+          import json
+          import os
+          import shutil
+          import traceback
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from typing import Iterable
+
+          import pandas as pd
+          import pyarrow as pa
+          import pyarrow.parquet as pq
+
+          try:
+              from pysus.api import sinan
+          except ImportError:
+              from pysus import sinan
+
+          ROOT = Path('artifact')
+          YEAR_DIR = ROOT / 'per_year'
+          PROV_DIR = ROOT / 'provenance'
+          YEARS = list(range(2015, 2026))
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for block in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(block)
+              return h.hexdigest()
+
+          def parquet_paths(value) -> list[Path]:
+              if value is None:
+                  return []
+              if isinstance(value, (str, os.PathLike)):
+                  p = Path(value)
+                  if p.is_dir():
+                      return sorted(p.rglob('*.parquet'))
+                  return [p] if p.suffix.lower() == '.parquet' else []
+              if isinstance(value, Iterable) and not isinstance(value, (pd.DataFrame, bytes, bytearray, str)):
+                  out: list[Path] = []
+                  for item in value:
+                      out.extend(parquet_paths(item))
+                  return out
+              return []
+
+          def materialize_year(result, year: int) -> tuple[Path, int, list[str], str]:
+              out = YEAR_DIR / f'SINAN_TUBE_BR_{year}.parquet'
+              if isinstance(result, pd.DataFrame):
+                  df = result.copy()
+                  result_kind = 'pandas_dataframe'
+              elif hasattr(result, 'df') and callable(result.df):
+                  df = result.df()
+                  result_kind = f'{type(result).__name__}.df'
+              else:
+                  paths = parquet_paths(result)
+                  if not paths:
+                      raise RuntimeError(f'PySUS returned unsupported object for {year}: {type(result)!r} {result!r}')
+                  frames = [pd.read_parquet(p) for p in paths]
+                  df = pd.concat(frames, ignore_index=True, sort=False)
+                  result_kind = f'parquet_paths:{len(paths)}'
+
+              if df.empty:
+                  raise RuntimeError(f'PySUS returned zero rows for {year}')
+              df.columns = [str(c).strip().upper() for c in df.columns]
+              if 'SOURCE_YEAR' in df.columns:
+                  df = df.rename(columns={'SOURCE_YEAR': 'SOURCE_YEAR_ORIGINAL'})
+              df.insert(0, 'SOURCE_YEAR', year)
+              df.to_parquet(out, index=False, compression='zstd')
+              return out, int(len(df)), list(df.columns), result_kind
+
+          manifest = {
+              'created_utc': datetime.now(timezone.utc).isoformat(),
+              'disease_code': 'TUBE',
+              'requested_years': YEARS,
+              'pysus_version': importlib.metadata.version('pysus'),
+              'pandas_version': importlib.metadata.version('pandas'),
+              'pyarrow_version': importlib.metadata.version('pyarrow'),
+              'years': {},
+              'failures': {},
+          }
+
+          for year in YEARS:
+              print(f'=== PySUS SINAN TUBE {year} ===', flush=True)
+              try:
+                  result = sinan(disease='TUBE', year=year)
+                  out, rows, columns, result_kind = materialize_year(result, year)
+                  manifest['years'][str(year)] = {
+                      'rows': rows,
+                      'columns': columns,
+                      'column_count': len(columns),
+                      'result_kind': result_kind,
+                      'path': str(out),
+                      'size_bytes': out.stat().st_size,
+                      'sha256': sha256(out),
+                  }
+                  print(json.dumps(manifest['years'][str(year)], indent=2), flush=True)
+              except Exception as exc:
+                  manifest['failures'][str(year)] = {
+                      'error_type': type(exc).__name__,
+                      'error': str(exc),
+                      'traceback': traceback.format_exc(),
+                  }
+                  print(manifest['failures'][str(year)]['traceback'], flush=True)
+
+          successful_years = sorted(int(y) for y in manifest['years'])
+          if len(successful_years) < 8:
+              raise SystemExit(f'Only {len(successful_years)} years succeeded: {successful_years}')
+          if not set(range(2018, 2025)).issubset(successful_years):
+              raise SystemExit(f'Missing one or more core years 2018-2024: {successful_years}')
+
+          (PROV_DIR / 'PYSUS_EXTRACTION_MANIFEST.json').write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          PY
+
+      - name: Build schema-union national Parquet and validation profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
           from pathlib import Path
 
-          p = Path('artifact/goias_tuberculose.csv')
-          with p.open('r', encoding='utf-8-sig', newline='') as f:
-              reader = csv.DictReader(f)
-              columns = reader.fieldnames or []
-              required = {'nu_notificacao','dt_diag_sintoma','dmun_codibge','dmun_municipiox','dmun_regiao_saudex','dmun_macro_regiaox','tp_entrada','tp_molecular','tp_sensibilidade'}
-              missing = sorted(required - set(columns))
-              if missing:
-                  raise SystemExit(f'Missing required fields: {missing}; columns={columns}')
-              rows = 0
-              seen = set()
-              duplicate_ids = 0
-              municipalities = set()
-              dates = []
-              molecular = Counter()
-              sensitivity = Counter()
-              entry = Counter()
-              for row in reader:
-                  rows += 1
-                  notification_id = row.get('nu_notificacao', '')
-                  if notification_id:
-                      if notification_id in seen:
-                          duplicate_ids += 1
-                      seen.add(notification_id)
-                  municipality = row.get('dmun_codibge', '')
-                  if municipality:
-                      municipalities.add(municipality)
-                  date_value = row.get('dt_diag_sintoma', '')
-                  if date_value:
-                      dates.append(date_value)
-                  molecular[row.get('tp_molecular', '') or '<NA>'] += 1
-                  sensitivity[row.get('tp_sensibilidade', '') or '<NA>'] += 1
-                  entry[row.get('tp_entrada', '') or '<NA>'] += 1
+          import duckdb
+          import pandas as pd
+          import pyarrow.parquet as pq
+
+          root = Path('artifact')
+          per_year = sorted((root / 'per_year').glob('SINAN_TUBE_BR_*.parquet'))
+          if not per_year:
+              raise SystemExit('No annual Parquet files were created')
+
+          union_path = root / 'BRAZIL_SINAN_TB_2015_2025_UNION.parquet'
+          con = duckdb.connect()
+          quoted = ', '.join(repr(str(p)) for p in per_year)
+          con.execute(
+              f"COPY (SELECT * FROM read_parquet([{quoted}], union_by_name=true)) "
+              f"TO {repr(str(union_path))} (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 100000)"
+          )
+
+          relation = con.sql(f"SELECT * FROM read_parquet({repr(str(union_path))})")
+          rows = int(relation.aggregate('count(*) AS n').fetchone()[0])
+          columns = [d[0] for d in relation.description]
+          source_year_counts = con.sql(
+              f"SELECT SOURCE_YEAR, count(*) AS n FROM read_parquet({repr(str(union_path))}) "
+              "GROUP BY SOURCE_YEAR ORDER BY SOURCE_YEAR"
+          ).df()
+
+          candidate_groups = {
+              'notification_date': ['DT_NOTIFIC', 'DT_DIAG', 'DT_SIN_PRI', 'DT_INIC_TR'],
+              'notification_id': ['NU_NOTIFIC', 'ID_AGRAVO'],
+              'municipality': ['ID_MUNICIP', 'ID_MN_RESI', 'ID_MN_NOTI', 'ID_MN_INTE'],
+              'molecular_test': ['TEST_MOLEC', 'TEST_MOLEC2', 'TEST_MOLEC3'],
+              'drug_susceptibility': ['TEST_SENSI', 'RESISTEN_I', 'RESISTEN_R'],
+              'treatment_or_outcome': ['SITUA_ENCE', 'TRATAMENTO', 'ESQUEMA'],
+              'entry_type': ['TRATAMENTO', 'TIPO_ENTRA'],
+              'hiv': ['HIV', 'ANT_RETRO'],
+          }
+          resolved = {
+              group: [c for c in candidates if c in columns]
+              for group, candidates in candidate_groups.items()
+          }
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for block in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(block)
+              return h.hexdigest()
 
           profile = {
               'rows': rows,
               'columns': columns,
-              'duplicate_notification_ids': duplicate_ids,
-              'date_min_raw': min(dates) if dates else None,
-              'date_max_raw': max(dates) if dates else None,
-              'municipalities': len(municipalities),
-              'molecular_values': dict(molecular.most_common(50)),
-              'sensitivity_values': dict(sensitivity.most_common(50)),
-              'entry_values': dict(entry.most_common(50)),
+              'column_count': len(columns),
+              'source_year_counts': source_year_counts.to_dict(orient='records'),
+              'candidate_field_resolution': resolved,
+              'union_path': str(union_path),
+              'union_size_bytes': union_path.stat().st_size,
+              'union_sha256': sha256(union_path),
+              'annual_files': [
+                  {
+                      'path': str(p),
+                      'rows': pq.ParquetFile(p).metadata.num_rows,
+                      'size_bytes': p.stat().st_size,
+                      'sha256': sha256(p),
+                  }
+                  for p in per_year
+              ],
           }
-          Path('artifact/RAW_PROFILE.json').write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          if rows < 500000:
+              raise SystemExit(f'National union unexpectedly small: {rows} rows')
+          if not resolved['municipality']:
+              raise SystemExit('No municipality field found')
+          if not resolved['notification_date']:
+              raise SystemExit('No date field found')
+          if not resolved['molecular_test'] and not resolved['drug_susceptibility']:
+              raise SystemExit('No molecular or susceptibility-testing field found')
+
+          (root / 'provenance' / 'NATIONAL_SCHEMA_PROFILE.json').write_text(
+              json.dumps(profile, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          source_year_counts.to_csv(root / 'provenance' / 'ROW_COUNTS_BY_YEAR.csv', index=False)
           print(json.dumps(profile, ensure_ascii=False, indent=2))
           PY
 
-      - name: Upload immutable source artifact
+      - name: Hash all deliverables
+        shell: bash
+        run: |
+          set -euo pipefail
+          find artifact -type f -print0 | sort -z | xargs -0 sha256sum > artifact/SHA256SUMS.txt
+          du -ah artifact | sort -h | tail -30
+
+      - name: Upload national SINAN-TB artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: brazil-goias-tb-source-20260718
+          name: brazil-national-sinan-tb-pysus-2015-2025
           path: artifact/
           if-no-files-found: error
-          compression-level: 6
+          compression-level: 0
           retention-days: 30
