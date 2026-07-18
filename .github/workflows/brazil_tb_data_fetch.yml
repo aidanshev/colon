@@ -33,35 +33,64 @@ jobs:
           sha256sum artifact/goias_tuberculose.csv > artifact/SHA256SUMS.txt
           printf '%s\n' "$URL" > artifact/SOURCE_URL.txt
 
-      - name: Validate and profile CSV
+      - name: Validate and profile CSV without external dependencies
         shell: bash
         run: |
           python - <<'PY'
-          import json
+          import csv, json
+          from collections import Counter
           from pathlib import Path
-          import pandas as pd
+
           p = Path('artifact/goias_tuberculose.csv')
-          df = pd.read_csv(p, dtype=str, low_memory=False, encoding='utf-8-sig')
-          required = {'nu_notificacao','dt_diag_sintoma','dmun_codibge','dmun_municipiox','dmun_regiao_saudex','dmun_macro_regiaox','tp_entrada','tp_molecular','tp_sensibilidade'}
-          missing = sorted(required - set(df.columns))
-          if missing:
-              raise SystemExit(f'Missing required fields: {missing}')
+          with p.open('r', encoding='utf-8-sig', newline='') as f:
+              reader = csv.DictReader(f)
+              columns = reader.fieldnames or []
+              required = {'nu_notificacao','dt_diag_sintoma','dmun_codibge','dmun_municipiox','dmun_regiao_saudex','dmun_macro_regiaox','tp_entrada','tp_molecular','tp_sensibilidade'}
+              missing = sorted(required - set(columns))
+              if missing:
+                  raise SystemExit(f'Missing required fields: {missing}; columns={columns}')
+              rows = 0
+              seen = set()
+              duplicate_ids = 0
+              municipalities = set()
+              dates = []
+              molecular = Counter()
+              sensitivity = Counter()
+              entry = Counter()
+              for row in reader:
+                  rows += 1
+                  notification_id = row.get('nu_notificacao', '')
+                  if notification_id:
+                      if notification_id in seen:
+                          duplicate_ids += 1
+                      seen.add(notification_id)
+                  municipality = row.get('dmun_codibge', '')
+                  if municipality:
+                      municipalities.add(municipality)
+                  date_value = row.get('dt_diag_sintoma', '')
+                  if date_value:
+                      dates.append(date_value)
+                  molecular[row.get('tp_molecular', '') or '<NA>'] += 1
+                  sensitivity[row.get('tp_sensibilidade', '') or '<NA>'] += 1
+                  entry[row.get('tp_entrada', '') or '<NA>'] += 1
+
           profile = {
-              'rows': int(len(df)),
-              'columns': list(df.columns),
-              'duplicate_notification_ids': int(df['nu_notificacao'].duplicated().sum()),
-              'date_min_raw': str(df['dt_diag_sintoma'].dropna().min()) if df['dt_diag_sintoma'].notna().any() else None,
-              'date_max_raw': str(df['dt_diag_sintoma'].dropna().max()) if df['dt_diag_sintoma'].notna().any() else None,
-              'municipalities': int(df['dmun_codibge'].nunique(dropna=True)),
-              'molecular_values': df['tp_molecular'].fillna('<NA>').value_counts().head(50).to_dict(),
-              'sensitivity_values': df['tp_sensibilidade'].fillna('<NA>').value_counts().head(50).to_dict(),
-              'entry_values': df['tp_entrada'].fillna('<NA>').value_counts().head(50).to_dict(),
+              'rows': rows,
+              'columns': columns,
+              'duplicate_notification_ids': duplicate_ids,
+              'date_min_raw': min(dates) if dates else None,
+              'date_max_raw': max(dates) if dates else None,
+              'municipalities': len(municipalities),
+              'molecular_values': dict(molecular.most_common(50)),
+              'sensitivity_values': dict(sensitivity.most_common(50)),
+              'entry_values': dict(entry.most_common(50)),
           }
           Path('artifact/RAW_PROFILE.json').write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding='utf-8')
           print(json.dumps(profile, ensure_ascii=False, indent=2))
           PY
 
       - name: Upload immutable source artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: brazil-goias-tb-source-20260718
