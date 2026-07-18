@@ -1,0 +1,113 @@
+name: Brazil TB enrichment data fetch
+
+on:
+  pull_request:
+    branches:
+      - feat/initial-simulation-structure
+    paths:
+      - .github/workflows/brazil_tb_enrichment_fetch.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-enrichment-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Download official Ministry of Health and IBGE resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact/raw artifact/extracted artifact/provenance
+
+          curl --fail --location --retry 5 --retry-all-errors \
+            'https://s3.sa-east-1.amazonaws.com/ckan.saude.gov.br/dbgeral/macroregiao_de_saude_csv.zip' \
+            --output artifact/raw/macroregiao_de_saude_csv.zip
+
+          curl --fail --location --retry 5 --retry-all-errors \
+            'https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2024/Brasil/BR_UF_2024.zip' \
+            --output artifact/raw/BR_UF_2024.zip
+
+          curl --fail --location --retry 5 --retry-all-errors \
+            'https://ftp.ibge.gov.br/Estimativas_de_Populacao/Estimativas_2024/POP2024_20241230.xls' \
+            --output artifact/raw/POP2024_20241230.xls
+
+          unzip -o artifact/raw/macroregiao_de_saude_csv.zip -d artifact/extracted/health_regions
+          unzip -o artifact/raw/BR_UF_2024.zip -d artifact/extracted/ibge_states
+
+          find artifact -type f -print0 | sort -z | xargs -0 sha256sum > artifact/provenance/SHA256SUMS.txt
+          find artifact -maxdepth 4 -type f -printf '%p\t%s bytes\n' | sort > artifact/provenance/FILE_INVENTORY.txt
+
+      - name: Profile downloaded resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import csv, json, os
+
+          root = Path('artifact')
+          report = {'health_region_files': [], 'state_shape_files': [], 'population_file': None}
+          for p in sorted((root/'extracted'/'health_regions').rglob('*')):
+              if p.is_file():
+                  report['health_region_files'].append({'path': str(p), 'size_bytes': p.stat().st_size})
+          for p in sorted((root/'extracted'/'ibge_states').rglob('*')):
+              if p.is_file():
+                  report['state_shape_files'].append({'path': str(p), 'size_bytes': p.stat().st_size})
+          pop = root/'raw'/'POP2024_20241230.xls'
+          report['population_file'] = {'path': str(pop), 'size_bytes': pop.stat().st_size}
+
+          csvs = list((root/'extracted'/'health_regions').rglob('*.csv'))
+          if not csvs:
+              raise SystemExit('No health-region CSV extracted')
+          candidate = max(csvs, key=lambda p: p.stat().st_size)
+          raw = candidate.read_bytes()
+          text = None
+          for enc in ['utf-8-sig','latin1','cp1252']:
+              try:
+                  text = raw.decode(enc)
+                  encoding = enc
+                  break
+              except UnicodeDecodeError:
+                  pass
+          if text is None:
+              raise SystemExit('Unable to decode health-region CSV')
+          sample = text[:20000]
+          delimiter = ';' if sample.count(';') > sample.count(',') else ','
+          reader = csv.DictReader(text.splitlines(), delimiter=delimiter)
+          rows = []
+          for i, row in enumerate(reader):
+              rows.append(row)
+              if i >= 9:
+                  break
+          report['health_region_csv_profile'] = {
+              'path': str(candidate),
+              'encoding': encoding,
+              'delimiter': delimiter,
+              'columns': reader.fieldnames,
+              'sample_rows': rows,
+          }
+          required_tokens = ['municip', 'regiao', 'macro']
+          normalized = ' '.join((reader.fieldnames or [])).lower()
+          missing = [t for t in required_tokens if t not in normalized]
+          if missing:
+              raise SystemExit(f'Health-region CSV missing expected column tokens: {missing}; columns={reader.fieldnames}')
+
+          shp = list((root/'extracted'/'ibge_states').rglob('*.shp'))
+          if not shp:
+              raise SystemExit('No IBGE state shapefile extracted')
+          report['state_shapefile'] = str(shp[0])
+          (root/'provenance'/'RESOURCE_PROFILE.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(report, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload official enrichment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: brazil-tb-official-health-region-map-population-20260718
+          path: artifact/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
