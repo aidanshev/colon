@@ -1,0 +1,66 @@
+name: Brazil TB public-data fetch
+
+on:
+  push:
+    branches:
+      - automation/brazil-tb-model-20260718
+    paths:
+      - .github/workflows/brazil_tb_data_fetch.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-goias-tb:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download official Goias SINAN-TB CSV
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          URL='https://dadosabertos.go.gov.br/dataset/ed7560d6-8547-420f-b86e-6a9b2389dcfb/resource/7da6db7e-7ac4-4a9d-9b8f-c8ff3b141f75/download/tuberculose.csv'
+          curl --fail --location --retry 5 --retry-all-errors --connect-timeout 30 --max-time 600 \
+            "$URL" -o artifact/goias_tuberculose.csv
+          test "$(stat -c%s artifact/goias_tuberculose.csv)" -gt 100000
+          sha256sum artifact/goias_tuberculose.csv > artifact/SHA256SUMS.txt
+          printf '%s\n' "$URL" > artifact/SOURCE_URL.txt
+
+      - name: Validate and profile CSV
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import pandas as pd
+          p = Path('artifact/goias_tuberculose.csv')
+          df = pd.read_csv(p, dtype=str, low_memory=False, encoding='utf-8-sig')
+          required = {'nu_notificacao','dt_diag_sintoma','dmun_codibge','dmun_municipiox','dmun_regiao_saudex','dmun_macro_regiaox','tp_entrada','tp_molecular','tp_sensibilidade'}
+          missing = sorted(required - set(df.columns))
+          if missing:
+              raise SystemExit(f'Missing required fields: {missing}')
+          profile = {
+              'rows': int(len(df)),
+              'columns': list(df.columns),
+              'duplicate_notification_ids': int(df['nu_notificacao'].duplicated().sum()),
+              'date_min_raw': str(df['dt_diag_sintoma'].dropna().min()) if df['dt_diag_sintoma'].notna().any() else None,
+              'date_max_raw': str(df['dt_diag_sintoma'].dropna().max()) if df['dt_diag_sintoma'].notna().any() else None,
+              'municipalities': int(df['dmun_codibge'].nunique(dropna=True)),
+              'molecular_values': df['tp_molecular'].fillna('<NA>').value_counts().head(50).to_dict(),
+              'sensitivity_values': df['tp_sensibilidade'].fillna('<NA>').value_counts().head(50).to_dict(),
+              'entry_values': df['tp_entrada'].fillna('<NA>').value_counts().head(50).to_dict(),
+          }
+          Path('artifact/RAW_PROFILE.json').write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(profile, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload immutable source artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: brazil-goias-tb-source-20260718
+          path: artifact/
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30
