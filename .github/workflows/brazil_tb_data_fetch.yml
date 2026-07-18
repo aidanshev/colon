@@ -6,6 +6,11 @@ on:
       - automation/brazil-tb-model-20260718
     paths:
       - .github/workflows/brazil_tb_data_fetch.yml
+  pull_request:
+    branches:
+      - feat/initial-simulation-structure
+    paths:
+      - .github/workflows/brazil_tb_data_fetch.yml
   workflow_dispatch:
 
 permissions:
