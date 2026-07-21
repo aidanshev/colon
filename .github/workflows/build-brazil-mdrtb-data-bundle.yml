@@ -1,0 +1,57 @@
+name: Build Brazil MDR-TB additional data bundle
+
+on:
+  push:
+    branches:
+      - brazil-mdrtb-data-bundle-v8
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BUNDLE_WORKDIR: ${{ github.workspace }}/bundle_work
+
+jobs:
+  build-bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install downloader dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests pandas beautifulsoup4 urllib3 openpyxl
+
+      - name: Build official public-data bundle
+        run: |
+          python tools/build_brazil_mdrtb_data_bundle.py 2>&1 | tee build_brazil_mdrtb_bundle.log
+
+      - name: Show bundle summary
+        if: always()
+        run: |
+          du -ah bundle_work | sort -h | tail -100 || true
+          find bundle_work -maxdepth 4 -type f -printf '%s %p\n' | sort -n || true
+          cat bundle_work/BRAZIL_MDRTB_ADDITIONAL_PUBLIC_DATA/DOWNLOAD_FAILURES.json || true
+
+      - name: Upload the one big ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: BRAZIL_MDRTB_ADDITIONAL_PUBLIC_DATA
+          path: |
+            bundle_work/BRAZIL_MDRTB_ADDITIONAL_PUBLIC_DATA.zip
+            bundle_work/BRAZIL_MDRTB_ADDITIONAL_PUBLIC_DATA/MANIFEST.csv
+            bundle_work/BRAZIL_MDRTB_ADDITIONAL_PUBLIC_DATA/SHA256SUMS.txt
+            bundle_work/BRAZIL_MDRTB_ADDITIONAL_PUBLIC_DATA/DOWNLOAD_FAILURES.json
+            build_brazil_mdrtb_bundle.log
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
